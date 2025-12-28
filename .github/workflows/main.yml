@@ -1,0 +1,139 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing firewall rule to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Local"
+          
+          # Allow localhost connections on port 3389 for the SSH tunnel
+          netsh advfirewall firewall add rule name="RDP-Local" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Custom Credentials
+        run: |
+          $username = "${{ secrets.RDP_USERNAME }}"
+          $password = "${{ secrets.RDP_PASSWORD }}"
+          
+          # Validate credentials are provided
+          if ([string]::IsNullOrWhiteSpace($username) -or [string]::IsNullOrWhiteSpace($password)) {
+              Write-Error "RDP_USERNAME and RDP_PASSWORD secrets must be set in repository settings"
+              exit 1
+          }
+          
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+          
+          echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name $username)) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+          
+          Write-Host "RDP user '$username' created successfully"
+
+      - name: Install and Configure OpenSSH Client
+        run: |
+          # Ensure OpenSSH client is installed (should be by default on windows-latest)
+          $sshClient = Get-WindowsCapability -Online | Where-Object Name -like 'OpenSSH.Client*'
+          if ($sshClient.State -ne "Installed") {
+              Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+          }
+          Write-Host "OpenSSH client ready"
+
+      - name: Establish Pinggy SSH Tunnel
+        run: |
+          Write-Host "Establishing Pinggy tunnel for RDP access..."
+          
+          # Start SSH tunnel in background and capture output
+          $tunnelProcess = Start-Process -FilePath "ssh" `
+            -ArgumentList "-p", "443", `
+                          "-R0:127.0.0.1:3389", `
+                          "-o", "StrictHostKeyChecking=no", `
+                          "-o", "ServerAliveInterval=30", `
+                          "m9oKScbEcJh+tcp@free.pinggy.io" `
+            -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\pinggy_output.txt"
+          
+          # Wait for tunnel to establish and capture the URL
+          Start-Sleep -Seconds 10
+          
+          $pinggyUrl = "Checking tunnel output..."
+          if (Test-Path "$env:TEMP\pinggy_output.txt") {
+              $output = Get-Content "$env:TEMP\pinggy_output.txt" -Raw
+              Write-Host "Pinggy Output:`n$output"
+              
+              # Extract the connection URL from output (format varies, look for tcp://...)
+              if ($output -match "(tcp://[^\s]+)") {
+                  $pinggyUrl = $matches[1]
+                  echo "PINGGY_URL=$pinggyUrl" >> $env:GITHUB_ENV
+              }
+          }
+          
+          echo "TUNNEL_PID=$($tunnelProcess.Id)" >> $env:GITHUB_ENV
+          Write-Host "Tunnel established with PID: $($tunnelProcess.Id)"
+      
+      - name: Verify RDP Service
+        run: |
+          # Test local RDP connectivity
+          $testResult = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "RDP service not responding on localhost:3389"
+              exit 1
+          }
+          Write-Host "RDP service verified and ready"
+
+      - name: Maintain Connection and Display Credentials
+        run: |
+          Write-Host "`n========================================"
+          Write-Host "=== RDP ACCESS VIA PINGGY TUNNEL ==="
+          Write-Host "========================================"
+          Write-Host ""
+          Write-Host "Connection URL: $env:PINGGY_URL"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "Connect using your RDP client:"
+          Write-Host "  - Extract host:port from the Pinggy URL"
+          Write-Host "  - Use the credentials above"
+          Write-Host ""
+          Write-Host "Tunnel PID: $env:TUNNEL_PID"
+          Write-Host "========================================"
+          Write-Host ""
+          
+          # Keep runner active indefinitely
+          while ($true) {
+              $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              Write-Host "[$timestamp] RDP tunnel active - Use workflow cancellation to terminate"
+              
+              # Verify tunnel process is still running
+              $tunnelAlive = Get-Process -Id $env:TUNNEL_PID -ErrorAction SilentlyContinue
+              if (-not $tunnelAlive) {
+                  Write-Error "SSH tunnel process died unexpectedly"
+                  exit 1
+              }
+              
+              Start-Sleep -Seconds 300
+          }
