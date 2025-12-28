@@ -55,13 +55,21 @@ jobs:
           
           Write-Host "RDP user '$username' configured and ready"
 
-      - name: Install and Configure OpenSSH Client
+      - name: Download and Install Pinggy Client
         run: |
-          $sshClient = Get-WindowsCapability -Online | Where-Object Name -like 'OpenSSH.Client*'
-          if ($sshClient.State -ne "Installed") {
-              Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+          $pinggyUrl = "https://s3.ap-south-1.amazonaws.com/public.pinggy.binaries/cli/v0.2.5/windows/amd64/pinggy.exe"
+          $pinggyPath = "$env:TEMP\pinggy.exe"
+          
+          Write-Host "Downloading Pinggy client from $pinggyUrl"
+          Invoke-WebRequest -Uri $pinggyUrl -OutFile $pinggyPath -UseBasicParsing
+          
+          if (-not (Test-Path $pinggyPath)) {
+              Write-Error "Failed to download pinggy.exe"
+              exit 1
           }
-          Write-Host "OpenSSH client ready"
+          
+          Write-Host "Pinggy client downloaded successfully to $pinggyPath"
+          echo "PINGGY_PATH=$pinggyPath" >> $env:GITHUB_ENV
       
       - name: Verify RDP Service
         run: |
@@ -74,55 +82,36 @@ jobs:
 
       - name: Run Tunnel Manager with Auto-Refresh
         run: |
+          $pinggyExe = $env:PINGGY_PATH
+          
           function Start-PinggyTunnel {
               $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
               Write-Host "[$timestamp] Starting Pinggy tunnel..."
               
-              # Kill any existing SSH processes
-              Get-Process ssh -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+              # Kill any existing pinggy processes
+              Get-Process pinggy -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
               Start-Sleep -Seconds 3
               
-              # Verify SSH is available
-              $sshPath = (Get-Command ssh -ErrorAction SilentlyContinue).Source
-              if (-not $sshPath) {
-                  Write-Error "SSH command not found in PATH"
+              # Verify pinggy.exe exists
+              if (-not (Test-Path $pinggyExe)) {
+                  Write-Error "Pinggy executable not found at $pinggyExe"
                   exit 1
               }
-              Write-Host "Using SSH from: $sshPath"
               
-              # Test basic SSH connectivity to Pinggy
-              Write-Host "Testing connection to free.pinggy.io on port 443..."
-              $testConn = Test-NetConnection -ComputerName free.pinggy.io -Port 443 -WarningAction SilentlyContinue
-              if (-not $testConn.TcpTestSucceeded) {
-                  Write-Error "Cannot reach free.pinggy.io:443"
-                  exit 1
-              }
-              Write-Host "Connection test successful!"
+              Write-Host "Starting Pinggy tunnel process..."
               
-              # Prepare log files
-              $logFile = "$env:TEMP\pinggy_stdout.log"
-              $errorFile = "$env:TEMP\pinggy_stderr.log"
-              
-              # Remove old logs
-              Remove-Item $logFile -Force -ErrorAction SilentlyContinue
-              Remove-Item $errorFile -Force -ErrorAction SilentlyContinue
-              
-              Write-Host "Starting SSH tunnel process..."
-              
-              # Start SSH with explicit shell execution to capture output properly
-              $sshArgs = @(
+              # Start Pinggy with connection string
+              $pinggyArgs = @(
                   "-p", "443",
                   "-R0:127.0.0.1:3389",
                   "-o", "StrictHostKeyChecking=no",
                   "-o", "ServerAliveInterval=30",
-                  "-o", "ExitOnForwardFailure=yes",
-                  "-v",
                   "m9oKScbEcJh+tcp@free.pinggy.io"
               )
               
               $processInfo = New-Object System.Diagnostics.ProcessStartInfo
-              $processInfo.FileName = "ssh"
-              $processInfo.Arguments = $sshArgs -join " "
+              $processInfo.FileName = $pinggyExe
+              $processInfo.Arguments = $pinggyArgs -join " "
               $processInfo.RedirectStandardOutput = $true
               $processInfo.RedirectStandardError = $true
               $processInfo.UseShellExecute = $false
@@ -138,28 +127,28 @@ jobs:
               $stdoutEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
                   if ($EventArgs.Data) {
                       [void]$Event.MessageData.AppendLine($EventArgs.Data)
-                      Write-Host "[SSH-OUT] $($EventArgs.Data)"
+                      Write-Host "[PINGGY] $($EventArgs.Data)"
                   }
               } -MessageData $stdoutBuilder
               
               $stderrEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action {
                   if ($EventArgs.Data) {
                       [void]$Event.MessageData.AppendLine($EventArgs.Data)
-                      Write-Host "[SSH-ERR] $($EventArgs.Data)"
+                      Write-Host "[PINGGY-ERR] $($EventArgs.Data)"
                   }
               } -MessageData $stderrBuilder
               
               $started = $process.Start()
               if (-not $started) {
-                  Write-Error "Failed to start SSH process"
+                  Write-Error "Failed to start Pinggy process"
                   exit 1
               }
               
               $process.BeginOutputReadLine()
               $process.BeginErrorReadLine()
               
-              Write-Host "SSH process started with PID: $($process.Id)"
-              Write-Host "Waiting for Pinggy URL (this takes 15-30 seconds)..."
+              Write-Host "Pinggy process started with PID: $($process.Id)"
+              Write-Host "Waiting for tunnel URL (this takes 10-20 seconds)..."
               
               # Wait and extract URL
               $pinggyUrl = "URL not captured yet"
@@ -172,25 +161,28 @@ jobs:
                   
                   # Check if process died
                   if ($process.HasExited) {
-                      Write-Host "SSH process exited with code: $($process.ExitCode)"
+                      Write-Host "Pinggy process exited with code: $($process.ExitCode)"
                       $stdout = $stdoutBuilder.ToString()
                       $stderr = $stderrBuilder.ToString()
                       Write-Host "`nFinal STDOUT:`n$stdout"
                       Write-Host "`nFinal STDERR:`n$stderr"
-                      Write-Error "SSH tunnel failed to establish"
+                      Write-Error "Pinggy tunnel failed to establish"
                       exit 1
                   }
                   
                   # Try to extract URL from captured output
                   $combinedOutput = $stdoutBuilder.ToString() + $stderrBuilder.ToString()
                   
-                  if ($combinedOutput -match "tcp://([^\s\n\r\)]+)") {
-                      $pinggyUrl = $matches[1].Trim()
-                      Write-Host "`nURL FOUND: $pinggyUrl"
+                  # Match various Pinggy URL formats
+                  if ($combinedOutput -match "(?:tcp://|https://|http://)([^\s\n\r\)\]]+)") {
+                      $pinggyUrl = $matches[0].Trim()
+                      Write-Host "`nURL FOUND: $pinggyUrl" -ForegroundColor Green
                       break
                   }
                   
-                  Write-Host "Waiting... ($elapsed/$maxWait seconds)"
+                  if ($elapsed % 10 -eq 0) {
+                      Write-Host "Waiting... ($elapsed/$maxWait seconds)"
+                  }
               }
               
               # Cleanup event handlers
