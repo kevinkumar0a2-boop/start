@@ -40,20 +40,37 @@ jobs:
               exit 1
           }
           
+          # Disable password complexity requirements for local accounts
+          secedit /export /cfg "$env:TEMP\secpol.cfg" | Out-Null
+          (Get-Content "$env:TEMP\secpol.cfg") -replace "PasswordComplexity = 1", "PasswordComplexity = 0" | Set-Content "$env:TEMP\secpol_new.cfg"
+          secedit /configure /db c:\windows\security\local.sdb /cfg "$env:TEMP\secpol_new.cfg /areas SECURITYPOLICY | Out-Null
+          Remove-Item "$env:TEMP\secpol.cfg", "$env:TEMP\secpol_new.cfg" -Force -ErrorAction SilentlyContinue
+          
+          # Create the user account
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+          try {
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -ErrorAction Stop
+              Write-Host "User '$username' created successfully"
+          } catch {
+              Write-Error "Failed to create user. Error: $($_.Exception.Message)"
+              Write-Host "Password must meet minimum requirements (typically 8+ chars with complexity)"
+              exit 1
+          }
+          
+          # Add to required groups
           Add-LocalGroupMember -Group "Administrators" -Member $username
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
           
           echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
           
+          # Final verification
           if (-not (Get-LocalUser -Name $username)) {
-              Write-Error "User creation failed"
+              Write-Error "User creation verification failed"
               exit 1
           }
           
-          Write-Host "RDP user '$username' created successfully"
+          Write-Host "RDP user '$username' configured and ready"
 
       - name: Install and Configure OpenSSH Client
         run: |
@@ -64,36 +81,122 @@ jobs:
           }
           Write-Host "OpenSSH client ready"
 
-      - name: Establish Pinggy SSH Tunnel
+      - name: Create Tunnel Management Script
         run: |
-          Write-Host "Establishing Pinggy tunnel for RDP access..."
-          
-          # Start SSH tunnel in background and capture output
-          $tunnelProcess = Start-Process -FilePath "ssh" `
-            -ArgumentList "-p", "443", `
-                          "-R0:127.0.0.1:3389", `
-                          "-o", "StrictHostKeyChecking=no", `
-                          "-o", "ServerAliveInterval=30", `
-                          "m9oKScbEcJh+tcp@free.pinggy.io" `
-            -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\pinggy_output.txt"
-          
-          # Wait for tunnel to establish and capture the URL
-          Start-Sleep -Seconds 10
-          
-          $pinggyUrl = "Checking tunnel output..."
-          if (Test-Path "$env:TEMP\pinggy_output.txt") {
-              $output = Get-Content "$env:TEMP\pinggy_output.txt" -Raw
-              Write-Host "Pinggy Output:`n$output"
+          $scriptContent = @'
+          function Start-PinggyTunnel {
+              $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              Write-Host "[$timestamp] Starting Pinggy tunnel..."
               
-              # Extract the connection URL from output (format varies, look for tcp://...)
-              if ($output -match "(tcp://[^\s]+)") {
-                  $pinggyUrl = $matches[1]
-                  echo "PINGGY_URL=$pinggyUrl" >> $env:GITHUB_ENV
+              # Kill any existing SSH processes to this endpoint
+              Get-Process ssh -ErrorAction SilentlyContinue | Where-Object {
+                  $_.CommandLine -like "*pinggy.io*"
+              } | Stop-Process -Force -ErrorAction SilentlyContinue
+              
+              Start-Sleep -Seconds 2
+              
+              # Start SSH tunnel with output redirection
+              $logFile = "$env:TEMP\pinggy_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+              $process = Start-Process -FilePath "ssh" `
+                -ArgumentList "-p", "443", `
+                              "-R0:127.0.0.1:3389", `
+                              "-o", "StrictHostKeyChecking=no", `
+                              "-o", "ServerAliveInterval=30", `
+                              "-o", "ExitOnForwardFailure=yes", `
+                              "m9oKScbEcJh+tcp@free.pinggy.io" `
+                -NoNewWindow -PassThru `
+                -RedirectStandardOutput $logFile `
+                -RedirectStandardError "$env:TEMP\pinggy_error.log"
+              
+              # Wait for tunnel to establish
+              Start-Sleep -Seconds 15
+              
+              # Extract URL from log file
+              $pinggyUrl = "Waiting for URL..."
+              $attempts = 0
+              while ($attempts -lt 20) {
+                  if (Test-Path $logFile) {
+                      $output = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
+                      
+                      # Try multiple regex patterns for Pinggy URL formats
+                      if ($output -match "tcp://([a-z0-9\-\.]+\.pinggy\.(?:io|link|online)):(\d+)") {
+                          $pinggyUrl = "tcp://$($matches[1]):$($matches[2])"
+                          break
+                      } elseif ($output -match "(tcp://[^\s\n]+)") {
+                          $pinggyUrl = $matches[1]
+                          break
+                      }
+                  }
+                  Start-Sleep -Seconds 2
+                  $attempts++
+              }
+              
+              # Display tunnel info
+              Write-Host "`n========================================" -ForegroundColor Cyan
+              Write-Host "=== NEW TUNNEL ESTABLISHED ===" -ForegroundColor Cyan
+              Write-Host "========================================" -ForegroundColor Cyan
+              Write-Host "URL: $pinggyUrl" -ForegroundColor Green
+              Write-Host "PID: $($process.Id)" -ForegroundColor Yellow
+              Write-Host "Log: $logFile" -ForegroundColor Gray
+              Write-Host "========================================`n" -ForegroundColor Cyan
+              
+              if (Test-Path $logFile) {
+                  Write-Host "Full Pinggy Output:"
+                  Get-Content $logFile | Write-Host
+                  Write-Host ""
+              }
+              
+              return @{
+                  Process = $process
+                  URL = $pinggyUrl
+                  LogFile = $logFile
               }
           }
           
-          echo "TUNNEL_PID=$($tunnelProcess.Id)" >> $env:GITHUB_ENV
-          Write-Host "Tunnel established with PID: $($tunnelProcess.Id)"
+          # Main loop - restart tunnel every 55 minutes
+          while ($true) {
+              $tunnelInfo = Start-PinggyTunnel
+              $process = $tunnelInfo.Process
+              $url = $tunnelInfo.URL
+              
+              Write-Host "`n========================================"
+              Write-Host "=== RDP ACCESS VIA PINGGY TUNNEL ==="
+              Write-Host "========================================"
+              Write-Host "Connection URL: $url"
+              Write-Host "Username: $env:RDP_USERNAME"
+              Write-Host "Password: $env:RDP_PASSWORD"
+              Write-Host ""
+              Write-Host "Connect using your RDP client:"
+              Write-Host "  - Use the URL above as host:port"
+              Write-Host "  - Tunnel will refresh in 55 minutes"
+              Write-Host "========================================"
+              Write-Host ""
+              
+              # Monitor tunnel for 55 minutes
+              $endTime = (Get-Date).AddMinutes(55)
+              while ((Get-Date) -lt $endTime) {
+                  $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                  $remaining = [math]::Round(($endTime - (Get-Date)).TotalMinutes, 1)
+                  
+                  # Check if process is still alive
+                  if (-not (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
+                      Write-Host "[$timestamp] WARNING: Tunnel died unexpectedly! Restarting..." -ForegroundColor Red
+                      break
+                  }
+                  
+                  Write-Host "[$timestamp] Tunnel active - $remaining minutes until refresh"
+                  Start-Sleep -Seconds 300  # Check every 5 minutes
+              }
+              
+              # Kill current tunnel before starting new one
+              Write-Host "`nRefreshing tunnel with new URL..." -ForegroundColor Yellow
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 3
+          }
+'@
+          
+          Set-Content -Path "$env:TEMP\tunnel_manager.ps1" -Value $scriptContent
+          Write-Host "Tunnel management script created"
       
       - name: Verify RDP Service
         run: |
@@ -105,35 +208,7 @@ jobs:
           }
           Write-Host "RDP service verified and ready"
 
-      - name: Maintain Connection and Display Credentials
+      - name: Run Tunnel Manager with Auto-Refresh
         run: |
-          Write-Host "`n========================================"
-          Write-Host "=== RDP ACCESS VIA PINGGY TUNNEL ==="
-          Write-Host "========================================"
-          Write-Host ""
-          Write-Host "Connection URL: $env:PINGGY_URL"
-          Write-Host "Username: $env:RDP_USERNAME"
-          Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host ""
-          Write-Host "Connect using your RDP client:"
-          Write-Host "  - Extract host:port from the Pinggy URL"
-          Write-Host "  - Use the credentials above"
-          Write-Host ""
-          Write-Host "Tunnel PID: $env:TUNNEL_PID"
-          Write-Host "========================================"
-          Write-Host ""
-          
-          # Keep runner active indefinitely
-          while ($true) {
-              $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-              Write-Host "[$timestamp] RDP tunnel active - Use workflow cancellation to terminate"
-              
-              # Verify tunnel process is still running
-              $tunnelAlive = Get-Process -Id $env:TUNNEL_PID -ErrorAction SilentlyContinue
-              if (-not $tunnelAlive) {
-                  Write-Error "SSH tunnel process died unexpectedly"
-                  exit 1
-              }
-              
-              Start-Sleep -Seconds 300
-          }
+          # Execute the tunnel management script
+          & "$env:TEMP\tunnel_manager.ps1"
