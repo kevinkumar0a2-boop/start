@@ -11,22 +11,11 @@ jobs:
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-
-          # Remove any existing firewall rule to avoid duplication
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
           netsh advfirewall firewall delete rule name="RDP-Local"
-          
-          # Allow localhost connections on port 3389 for the SSH tunnel
-          netsh advfirewall firewall add rule name="RDP-Local" `
-            dir=in action=allow protocol=TCP localport=3389
-
-          # Restart the Remote Desktop service to ensure changes take effect
+          netsh advfirewall firewall add rule name="RDP-Local" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Custom Credentials
@@ -34,37 +23,31 @@ jobs:
           $username = "${{ secrets.RDP_USERNAME }}"
           $password = "${{ secrets.RDP_PASSWORD }}"
           
-          # Validate credentials are provided
           if ([string]::IsNullOrWhiteSpace($username) -or [string]::IsNullOrWhiteSpace($password)) {
               Write-Error "RDP_USERNAME and RDP_PASSWORD secrets must be set in repository settings"
               exit 1
           }
           
-          # Disable password complexity requirements for local accounts
           secedit /export /cfg "$env:TEMP\secpol.cfg" | Out-Null
           (Get-Content "$env:TEMP\secpol.cfg") -replace "PasswordComplexity = 1", "PasswordComplexity = 0" | Set-Content "$env:TEMP\secpol_new.cfg"
-          secedit /configure /db c:\windows\security\local.sdb /cfg "$env:TEMP\secpol_new.cfg /areas SECURITYPOLICY | Out-Null
+          secedit /configure /db c:\windows\security\local.sdb /cfg "$env:TEMP\secpol_new.cfg" /areas SECURITYPOLICY | Out-Null
           Remove-Item "$env:TEMP\secpol.cfg", "$env:TEMP\secpol_new.cfg" -Force -ErrorAction SilentlyContinue
           
-          # Create the user account
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           try {
               New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -ErrorAction Stop
               Write-Host "User '$username' created successfully"
           } catch {
               Write-Error "Failed to create user. Error: $($_.Exception.Message)"
-              Write-Host "Password must meet minimum requirements (typically 8+ chars with complexity)"
               exit 1
           }
           
-          # Add to required groups
           Add-LocalGroupMember -Group "Administrators" -Member $username
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
           
           echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
           
-          # Final verification
           if (-not (Get-LocalUser -Name $username)) {
               Write-Error "User creation verification failed"
               exit 1
@@ -74,51 +57,44 @@ jobs:
 
       - name: Install and Configure OpenSSH Client
         run: |
-          # Ensure OpenSSH client is installed (should be by default on windows-latest)
           $sshClient = Get-WindowsCapability -Online | Where-Object Name -like 'OpenSSH.Client*'
           if ($sshClient.State -ne "Installed") {
               Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
           }
           Write-Host "OpenSSH client ready"
-
-      - name: Create Tunnel Management Script
+      
+      - name: Verify RDP Service
         run: |
-          $scriptContent = @"
+          $testResult = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "RDP service not responding on localhost:3389"
+              exit 1
+          }
+          Write-Host "RDP service verified and ready"
+
+      - name: Run Tunnel Manager with Auto-Refresh
+        run: |
           function Start-PinggyTunnel {
               $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
               Write-Host "[$timestamp] Starting Pinggy tunnel..."
               
-              # Kill any existing SSH processes to this endpoint
               Get-Process ssh -ErrorAction SilentlyContinue | Where-Object {
                   $_.CommandLine -like "*pinggy.io*"
               } | Stop-Process -Force -ErrorAction SilentlyContinue
               
               Start-Sleep -Seconds 2
               
-              # Start SSH tunnel with output redirection
               $logFile = "$env:TEMP\pinggy_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-              $process = Start-Process -FilePath "ssh" `
-                -ArgumentList "-p", "443", `
-                              "-R0:127.0.0.1:3389", `
-                              "-o", "StrictHostKeyChecking=no", `
-                              "-o", "ServerAliveInterval=30", `
-                              "-o", "ExitOnForwardFailure=yes", `
-                              "m9oKScbEcJh+tcp@free.pinggy.io" `
-                -NoNewWindow -PassThru `
-                -RedirectStandardOutput $logFile `
-                -RedirectStandardError "$env:TEMP\pinggy_error.log"
+              $process = Start-Process -FilePath "ssh" -ArgumentList "-p", "443", "-R0:127.0.0.1:3389", "-o", "StrictHostKeyChecking=no", "-o", "ServerAliveInterval=30", "-o", "ExitOnForwardFailure=yes", "m9oKScbEcJh+tcp@free.pinggy.io" -NoNewWindow -PassThru -RedirectStandardOutput $logFile -RedirectStandardError "$env:TEMP\pinggy_error.log"
               
-              # Wait for tunnel to establish
               Start-Sleep -Seconds 15
               
-              # Extract URL from log file
               $pinggyUrl = "Waiting for URL..."
               $attempts = 0
               while ($attempts -lt 20) {
                   if (Test-Path $logFile) {
                       $output = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
                       
-                      # Try multiple regex patterns for Pinggy URL formats
                       if ($output -match "tcp://([a-z0-9\-\.]+\.pinggy\.(?:io|link|online)):(\d+)") {
                           $pinggyUrl = "tcp://$($matches[1]):$($matches[2])"
                           break
@@ -131,7 +107,6 @@ jobs:
                   $attempts++
               }
               
-              # Display tunnel info
               Write-Host "`n========================================" -ForegroundColor Cyan
               Write-Host "=== NEW TUNNEL ESTABLISHED ===" -ForegroundColor Cyan
               Write-Host "========================================" -ForegroundColor Cyan
@@ -153,7 +128,6 @@ jobs:
               }
           }
           
-          # Main loop - restart tunnel every 55 minutes
           while ($true) {
               $tunnelInfo = Start-PinggyTunnel
               $process = $tunnelInfo.Process
@@ -172,43 +146,21 @@ jobs:
               Write-Host "========================================"
               Write-Host ""
               
-              # Monitor tunnel for 55 minutes
               $endTime = (Get-Date).AddMinutes(55)
               while ((Get-Date) -lt $endTime) {
                   $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                   $remaining = [math]::Round(($endTime - (Get-Date)).TotalMinutes, 1)
                   
-                  # Check if process is still alive
                   if (-not (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
                       Write-Host "[$timestamp] WARNING: Tunnel died unexpectedly! Restarting..." -ForegroundColor Red
                       break
                   }
                   
                   Write-Host "[$timestamp] Tunnel active - $remaining minutes until refresh"
-                  Start-Sleep -Seconds 300  # Check every 5 minutes
+                  Start-Sleep -Seconds 300
               }
               
-              # Kill current tunnel before starting new one
               Write-Host "`nRefreshing tunnel with new URL..." -ForegroundColor Yellow
               Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
               Start-Sleep -Seconds 3
           }
-"@
-          
-          Set-Content -Path "$env:TEMP\tunnel_manager.ps1" -Value $scriptContent
-          Write-Host "Tunnel management script created"
-      
-      - name: Verify RDP Service
-        run: |
-          # Test local RDP connectivity
-          $testResult = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "RDP service not responding on localhost:3389"
-              exit 1
-          }
-          Write-Host "RDP service verified and ready"
-
-      - name: Run Tunnel Manager with Auto-Refresh
-        run: |
-          # Execute the tunnel management script
-          & "$env:TEMP\tunnel_manager.ps1"
