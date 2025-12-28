@@ -78,82 +78,135 @@ jobs:
               $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
               Write-Host "[$timestamp] Starting Pinggy tunnel..."
               
-              Get-Process ssh -ErrorAction SilentlyContinue | Where-Object {
-                  $_.CommandLine -like "*pinggy.io*"
-              } | Stop-Process -Force -ErrorAction SilentlyContinue
+              # Kill any existing SSH processes
+              Get-Process ssh -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 3
               
-              Start-Sleep -Seconds 2
+              # Verify SSH is available
+              $sshPath = (Get-Command ssh -ErrorAction SilentlyContinue).Source
+              if (-not $sshPath) {
+                  Write-Error "SSH command not found in PATH"
+                  exit 1
+              }
+              Write-Host "Using SSH from: $sshPath"
               
-              $logFile = "$env:TEMP\pinggy_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-              $errorFile = "$env:TEMP\pinggy_error_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-              $process = Start-Process -FilePath "ssh" -ArgumentList "-p", "443", "-R0:127.0.0.1:3389", "-o", "StrictHostKeyChecking=no", "-o", "ServerAliveInterval=30", "-o", "ExitOnForwardFailure=yes", "m9oKScbEcJh+tcp@free.pinggy.io" -NoNewWindow -PassThru -RedirectStandardOutput $logFile -RedirectStandardError $errorFile
+              # Test basic SSH connectivity to Pinggy
+              Write-Host "Testing connection to free.pinggy.io on port 443..."
+              $testConn = Test-NetConnection -ComputerName free.pinggy.io -Port 443 -WarningAction SilentlyContinue
+              if (-not $testConn.TcpTestSucceeded) {
+                  Write-Error "Cannot reach free.pinggy.io:443"
+                  exit 1
+              }
+              Write-Host "Connection test successful!"
               
-              Write-Host "Waiting for Pinggy URL (checking both stdout and stderr)..."
-              Start-Sleep -Seconds 20
+              # Prepare log files
+              $logFile = "$env:TEMP\pinggy_stdout.log"
+              $errorFile = "$env:TEMP\pinggy_stderr.log"
               
-              $pinggyUrl = "URL not found"
-              $attempts = 0
-              while ($attempts -lt 30) {
-                  $foundUrl = $false
+              # Remove old logs
+              Remove-Item $logFile -Force -ErrorAction SilentlyContinue
+              Remove-Item $errorFile -Force -ErrorAction SilentlyContinue
+              
+              Write-Host "Starting SSH tunnel process..."
+              
+              # Start SSH with explicit shell execution to capture output properly
+              $sshArgs = @(
+                  "-p", "443",
+                  "-R0:127.0.0.1:3389",
+                  "-o", "StrictHostKeyChecking=no",
+                  "-o", "ServerAliveInterval=30",
+                  "-o", "ExitOnForwardFailure=yes",
+                  "-v",
+                  "m9oKScbEcJh+tcp@free.pinggy.io"
+              )
+              
+              $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+              $processInfo.FileName = "ssh"
+              $processInfo.Arguments = $sshArgs -join " "
+              $processInfo.RedirectStandardOutput = $true
+              $processInfo.RedirectStandardError = $true
+              $processInfo.UseShellExecute = $false
+              $processInfo.CreateNoWindow = $true
+              
+              $process = New-Object System.Diagnostics.Process
+              $process.StartInfo = $processInfo
+              
+              # Capture output in real-time
+              $stdoutBuilder = New-Object System.Text.StringBuilder
+              $stderrBuilder = New-Object System.Text.StringBuilder
+              
+              $stdoutEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
+                  if ($EventArgs.Data) {
+                      [void]$Event.MessageData.AppendLine($EventArgs.Data)
+                      Write-Host "[SSH-OUT] $($EventArgs.Data)"
+                  }
+              } -MessageData $stdoutBuilder
+              
+              $stderrEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action {
+                  if ($EventArgs.Data) {
+                      [void]$Event.MessageData.AppendLine($EventArgs.Data)
+                      Write-Host "[SSH-ERR] $($EventArgs.Data)"
+                  }
+              } -MessageData $stderrBuilder
+              
+              $started = $process.Start()
+              if (-not $started) {
+                  Write-Error "Failed to start SSH process"
+                  exit 1
+              }
+              
+              $process.BeginOutputReadLine()
+              $process.BeginErrorReadLine()
+              
+              Write-Host "SSH process started with PID: $($process.Id)"
+              Write-Host "Waiting for Pinggy URL (this takes 15-30 seconds)..."
+              
+              # Wait and extract URL
+              $pinggyUrl = "URL not captured yet"
+              $maxWait = 60
+              $elapsed = 0
+              
+              while ($elapsed -lt $maxWait) {
+                  Start-Sleep -Seconds 2
+                  $elapsed += 2
                   
-                  if (Test-Path $logFile) {
-                      $output = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
-                      if ($output -and $output.Trim()) {
-                          Write-Host "STDOUT Content: $output"
-                          if ($output -match "tcp://([^\s\n\r]+)") {
-                              $pinggyUrl = $matches[1].Trim()
-                              $foundUrl = $true
-                          }
-                      }
+                  # Check if process died
+                  if ($process.HasExited) {
+                      Write-Host "SSH process exited with code: $($process.ExitCode)"
+                      $stdout = $stdoutBuilder.ToString()
+                      $stderr = $stderrBuilder.ToString()
+                      Write-Host "`nFinal STDOUT:`n$stdout"
+                      Write-Host "`nFinal STDERR:`n$stderr"
+                      Write-Error "SSH tunnel failed to establish"
+                      exit 1
                   }
                   
-                  if (-not $foundUrl -and (Test-Path $errorFile)) {
-                      $errorOutput = Get-Content $errorFile -Raw -ErrorAction SilentlyContinue
-                      if ($errorOutput -and $errorOutput.Trim()) {
-                          Write-Host "STDERR Content: $errorOutput"
-                          if ($errorOutput -match "tcp://([^\s\n\r]+)") {
-                              $pinggyUrl = $matches[1].Trim()
-                              $foundUrl = $true
-                          }
-                      }
-                  }
+                  # Try to extract URL from captured output
+                  $combinedOutput = $stdoutBuilder.ToString() + $stderrBuilder.ToString()
                   
-                  if ($foundUrl) {
+                  if ($combinedOutput -match "tcp://([^\s\n\r\)]+)") {
+                      $pinggyUrl = $matches[1].Trim()
+                      Write-Host "`nURL FOUND: $pinggyUrl"
                       break
                   }
                   
-                  Start-Sleep -Seconds 3
-                  $attempts++
-                  Write-Host "Attempt $attempts/30 - Still waiting for URL..."
+                  Write-Host "Waiting... ($elapsed/$maxWait seconds)"
               }
               
+              # Cleanup event handlers
+              Unregister-Event -SourceIdentifier $stdoutEvent.Name -ErrorAction SilentlyContinue
+              Unregister-Event -SourceIdentifier $stderrEvent.Name -ErrorAction SilentlyContinue
+              
               Write-Host "`n========================================" -ForegroundColor Cyan
-              Write-Host "=== NEW TUNNEL ESTABLISHED ===" -ForegroundColor Cyan
+              Write-Host "=== TUNNEL ESTABLISHED ===" -ForegroundColor Cyan
               Write-Host "========================================" -ForegroundColor Cyan
               Write-Host "URL: $pinggyUrl" -ForegroundColor Green
               Write-Host "PID: $($process.Id)" -ForegroundColor Yellow
               Write-Host "========================================`n" -ForegroundColor Cyan
               
-              Write-Host "Full Output from STDOUT:"
-              if (Test-Path $logFile) {
-                  Get-Content $logFile | Write-Host
-              } else {
-                  Write-Host "(No stdout output)"
-              }
-              
-              Write-Host "`nFull Output from STDERR:"
-              if (Test-Path $errorFile) {
-                  Get-Content $errorFile | Write-Host
-              } else {
-                  Write-Host "(No stderr output)"
-              }
-              Write-Host ""
-              
               return @{
                   Process = $process
                   URL = $pinggyUrl
-                  LogFile = $logFile
-                  ErrorFile = $errorFile
               }
           }
           
@@ -180,7 +233,7 @@ jobs:
                   $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                   $remaining = [math]::Round(($endTime - (Get-Date)).TotalMinutes, 1)
                   
-                  if (-not (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
+                  if ($process.HasExited) {
                       Write-Host "[$timestamp] WARNING: Tunnel died unexpectedly! Restarting..." -ForegroundColor Red
                       break
                   }
@@ -190,6 +243,9 @@ jobs:
               }
               
               Write-Host "`nRefreshing tunnel with new URL..." -ForegroundColor Yellow
-              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              if (-not $process.HasExited) {
+                  $process.Kill()
+              }
+              $process.Dispose()
               Start-Sleep -Seconds 3
           }
